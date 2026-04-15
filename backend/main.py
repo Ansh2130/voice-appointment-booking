@@ -22,6 +22,8 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # In-memory conversation state per session
 sessions = {}
+recent_bookings = {}  # email -> last booking time (prevent duplicate)
+MAX_SESSIONS = 100
 
 SYSTEM_PROMPT = """You are a friendly voice receptionist AI for City Clinic. You are having a real-time voice conversation with a patient. Be natural, warm, and conversational — like a real receptionist on a phone call.
 
@@ -63,6 +65,8 @@ ACTION: {{"action": "check_availability", "doctor": "dr. sharma", "date": "2026-
 - Only output the ACTION when you have ALL 5 pieces of info AND user confirmed email.
 - Do NOT add any text before or after the ACTION line.
 """
+
+
 class ChatRequest(BaseModel):
     session_id: str
     message: str
@@ -76,6 +80,11 @@ class ChatResponse(BaseModel):
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    # Cleanup old sessions if too many
+    if len(sessions) > MAX_SESSIONS:
+        oldest = list(sessions.keys())[0]
+        del sessions[oldest]
+
     # Init session
     if req.session_id not in sessions:
         sessions[req.session_id] = []
@@ -83,16 +92,26 @@ async def chat(req: ChatRequest):
     history = sessions[req.session_id]
     history.append({"role": "user", "content": req.message})
 
+    # Keep history manageable — only last 20 messages
+    if len(history) > 20:
+        history = history[-20:]
+        sessions[req.session_id] = history
+
     today = datetime.now().strftime("%A, %B %d, %Y")
     system = SYSTEM_PROMPT.replace("{today}", today)
 
     # Call Groq
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "system", "content": system}] + history,
-        temperature=0.3,
-        max_tokens=500,
-    )
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "system", "content": system}] + history,
+            temperature=0.3,
+            max_tokens=500,
+        )
+    except Exception as e:
+        print(f"DEBUG GROQ ERROR: {str(e)}")
+        reply_text = "I'm having a little trouble right now. Could you try again in a moment?"
+        return ChatResponse(reply=reply_text)
 
     reply = response.choices[0].message.content
     history.append({"role": "assistant", "content": reply})
@@ -121,7 +140,26 @@ async def chat(req: ChatRequest):
 
             print(f"DEBUG ACTION: {action}")
 
-            # Check availability first
+            # Validate doctor
+            if action.get("doctor") not in DOCTORS:
+                reply_text = "I didn't catch which doctor you'd like. We have Dr. Sharma and Dr. Patel. Which one?"
+                history.append({"role": "assistant", "content": reply_text})
+                return ChatResponse(reply=reply_text)
+
+            # Validate email format
+            if "@" not in action.get("patient_email", ""):
+                reply_text = "That email doesn't look right. Could you say your email address again slowly?"
+                history.append({"role": "assistant", "content": reply_text})
+                return ChatResponse(reply=reply_text)
+
+            # Check duplicate booking — same email + same doctor + same date
+            booking_key = f"{action['patient_email']}_{action['doctor']}_{action['date']}"
+            if booking_key in recent_bookings:
+                reply_text = f"It looks like you already have a booking with {DOCTORS[action['doctor']]['name']} on {action['date']}. Would you like to book a different day instead?"
+                history.append({"role": "assistant", "content": reply_text})
+                return ChatResponse(reply=reply_text)
+
+            # Check availability
             slots = await get_available_slots(action["doctor"], action["date"])
             print(f"DEBUG SLOTS: {slots}")
 
@@ -130,7 +168,7 @@ async def chat(req: ChatRequest):
                 history.append({"role": "assistant", "content": reply_text})
                 return ChatResponse(reply=reply_text)
 
-            # Check if requested time is available
+            # Collect all available slot times
             date_slots = []
             for date_key, slot_list in slots.items():
                 date_slots.extend([s.get("time") or s.get("start") for s in slot_list])
@@ -138,12 +176,12 @@ async def chat(req: ChatRequest):
             # Find matching slot
             slot_match = None
             for slot in date_slots:
-                if action["time"] in slot:
+                if slot and action["time"] in slot:
                     slot_match = slot
                     break
 
             if not slot_match:
-                available_times = [s.split("T")[1][:5] for s in date_slots[:5]]
+                available_times = [s.split("T")[1][:5] for s in date_slots[:5] if s]
                 if available_times:
                     reply_text = f"Sorry, {action['time']} is not available. Available slots are: {', '.join(available_times)}. Which one works for you?"
                 else:
@@ -163,7 +201,9 @@ async def chat(req: ChatRequest):
 
             if result.get("success"):
                 doctor_name = DOCTORS[action["doctor"]]["name"]
-                reply_text = f"Your appointment with {doctor_name} on {action['date']} at {action['time']} is confirmed! A calendar invite has been sent to {action['patient_email']}."
+                # Track this booking to prevent duplicates
+                recent_bookings[booking_key] = datetime.now().isoformat()
+                reply_text = f"You're all set! Your appointment with {doctor_name} on {action['date']} at {action['time']} is confirmed. A calendar invite has been sent to {action['patient_email']}. Have a great day!"
                 history.append({"role": "assistant", "content": reply_text})
                 return ChatResponse(
                     reply=reply_text,
@@ -173,15 +213,20 @@ async def chat(req: ChatRequest):
             else:
                 error_msg = result.get("error", "Unknown error")
                 print(f"DEBUG BOOKING ERROR: {error_msg}")
-                reply_text = "Sorry, there was an issue booking. Please try again or pick a different time."
+                reply_text = "Sorry, there was an issue booking that slot. Could you try a different time?"
                 history.append({"role": "assistant", "content": reply_text})
                 return ChatResponse(reply=reply_text)
 
+        except json.JSONDecodeError as e:
+            print(f"DEBUG JSON ERROR: {str(e)}")
+            reply_text = "I had trouble processing that. Let me try again — what time works for you?"
+            history.append({"role": "assistant", "content": reply_text})
+            return ChatResponse(reply=reply_text)
         except Exception as e:
             print(f"DEBUG EXCEPTION: {str(e)}")
             import traceback
             traceback.print_exc()
-            reply_text = "I had trouble processing that. Could you repeat your preferred time?"
+            reply_text = "Something went wrong on my end. Could you repeat that?"
             history.append({"role": "assistant", "content": reply_text})
             return ChatResponse(reply=reply_text)
 

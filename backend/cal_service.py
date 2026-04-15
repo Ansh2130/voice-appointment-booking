@@ -30,28 +30,36 @@ async def get_available_slots(doctor_key: str, date_str: str):
     if not doctor:
         return {"error": "Doctor not found"}
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{BASE_URL}/slots",
-            params={
-                "username": CAL_USERNAME,
-                "eventTypeSlug": doctor["slug"],
-                "start": date_str,
-                "end": date_str,
-                "timeZone": "Asia/Kolkata",
-            },
-            headers={
-                "Authorization": f"Bearer {CAL_API_KEY}",
-                "cal-api-version": "2024-09-04",
-            },
-        )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{BASE_URL}/slots",
+                params={
+                    "username": CAL_USERNAME,
+                    "eventTypeSlug": doctor["slug"],
+                    "start": date_str,
+                    "end": date_str,
+                    "timeZone": "Asia/Kolkata",
+                },
+                headers={
+                    "Authorization": f"Bearer {CAL_API_KEY}",
+                    "cal-api-version": "2024-09-04",
+                },
+            )
 
-    print(f"DEBUG SLOTS STATUS: {resp.status_code}")
-    print(f"DEBUG SLOTS RESPONSE: {resp.text[:500]}")
+        print(f"DEBUG SLOTS STATUS: {resp.status_code}")
+        print(f"DEBUG SLOTS RESPONSE: {resp.text[:500]}")
 
-    if resp.status_code == 200:
-        return resp.json().get("data", {})
-    return {"error": resp.text}
+        if resp.status_code == 200:
+            return resp.json().get("data", {})
+        return {"error": resp.text}
+
+    except httpx.TimeoutException:
+        print("DEBUG SLOTS TIMEOUT")
+        return {"error": "Cal.com took too long to respond"}
+    except Exception as e:
+        print(f"DEBUG SLOTS ERROR: {str(e)}")
+        return {"error": str(e)}
 
 
 async def book_appointment(doctor_key: str, start_time: str, patient_name: str, patient_email: str):
@@ -74,20 +82,28 @@ async def book_appointment(doctor_key: str, start_time: str, patient_name: str, 
 
     print(f"DEBUG BOOKING PAYLOAD: {payload}")
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{BASE_URL}/bookings",
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {CAL_API_KEY}",
-                "cal-api-version": "2024-08-13",
-                "Content-Type": "application/json",
-            },
-        )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{BASE_URL}/bookings",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {CAL_API_KEY}",
+                    "cal-api-version": "2024-08-13",
+                    "Content-Type": "application/json",
+                },
+            )
 
-    print(f"DEBUG BOOKING STATUS: {resp.status_code}")
-    print(f"DEBUG BOOKING RESPONSE: {resp.text[:500]}")
+        print(f"DEBUG BOOKING STATUS: {resp.status_code}")
+        print(f"DEBUG BOOKING RESPONSE: {resp.text[:500]}")
 
-    if resp.status_code in [200, 201]:
-        return {"success": True, "data": resp.json()}
-    return {"error": resp.text}
+        if resp.status_code in [200, 201]:
+            return {"success": True, "data": resp.json()}
+        return {"error": resp.text}
+
+    except httpx.TimeoutException:
+        print("DEBUG BOOKING TIMEOUT")
+        return {"error": "Cal.com took too long to respond"}
+    except Exception as e:
+        print(f"DEBUG BOOKING ERROR: {str(e)}")
+        return {"error": str(e)}
